@@ -2,9 +2,12 @@
 Gaffer - single-file FPL dashboard (deploy via Streamlit Community Cloud).
 Everything in one file on purpose, so it's easy to upload/edit from a phone.
 """
+import unicodedata
+
 import numpy as np
 import pandas as pd
 import plotly.express as px
+import pulp
 import requests
 import streamlit as st
 
@@ -21,9 +24,23 @@ STATUS_LABELS = {"a": "Available", "d": "Doubtful", "i": "Injured", "s": "Suspen
 BASE_URL = "https://fantasy.premierleague.com/api"
 LAST_SEASON_CSV = ("https://raw.githubusercontent.com/vaastav/Fantasy-Premier-League/"
                     "master/data/2025-26/players_raw.csv")
+LAST_SEASON_GW_CSV = ("https://raw.githubusercontent.com/vaastav/Fantasy-Premier-League/"
+                       "master/data/2025-26/gws/merged_gw.csv")
+LAST_SEASON_TEAMS_CSV = ("https://raw.githubusercontent.com/vaastav/Fantasy-Premier-League/"
+                          "master/data/2025-26/teams.csv")
+LAST_SEASON_FIXTURES_CSV = ("https://raw.githubusercontent.com/vaastav/Fantasy-Premier-League/"
+                             "master/data/2025-26/fixtures.csv")
 FONT = "-apple-system, BlinkMacSystemFont, Segoe UI, Roboto, Helvetica, Arial, sans-serif"
 K_GAMEWEEKS = 8        # gameweeks until "this season" fully outweighs "last season" in Blended mode
 LOW_SAMPLE_STARTS = 3   # fewer starts than this this season = flagged as a small sample
+
+# --- Squad Optimizer tuning ---
+EXCEPTIONAL_CS_RATE = 0.40   # clean sheet rate (last season) above which a club can carry 2+ of your defenders
+BENCH_SAFE_MINUTES = 1500    # last-season PL minutes a bench player needs to skip the "reliable bench" check
+RELIABILITY_MINUTES_CAP = 2500  # last-season minutes at which a player's reliability multiplier maxes out
+SQUAD_RULES = {"GKP": 2, "DEF": 5, "MID": 5, "FWD": 3}
+FORMATION_MIN = {"GKP": 1, "DEF": 3, "MID": 2, "FWD": 1}
+FORMATION_MAX = {"GKP": 1, "DEF": 5, "MID": 5, "FWD": 3}
 
 DEFINITIONS = {
     "blended": (f"Blends last season's per-gameweek rate with this season's actual rate, shifting "
@@ -44,6 +61,21 @@ DEFINITIONS = {
                           "them. Useful for spotting expensive players nobody trusts yet.",
     "price_vs_points": "Every player plotted by current price against their value basis (selected "
                        "below). The closer to the top-left, the better the bargain.",
+    "optimizer": ("Builds the best possible 15-player squad within your budget, using last season's "
+                  "gameweek-by-gameweek data rather than season totals. Keepers and defenders are scored "
+                  "mostly on their club's clean-sheet + defensive-contribution record; midfielders get "
+                  "personal defensive-contribution and attacking rates added to a small clean-sheet "
+                  "component; forwards are scored on attacking rate alone. The optimizer picks the best "
+                  "11 to start and fills the other 4 bench spots as cheaply as possible, so your budget "
+                  "goes where it actually scores points."),
+    "exceptional_defense": ("By default only one defender per club is allowed, since one bad game or one "
+                            "injury can wipe out an entire back line's clean-sheet run. Clubs whose clean "
+                            "sheet rate last season was 40%+ are the exception - genuinely strong enough "
+                            "defensively that doubling up is still reasonable risk."),
+    "transferred": ("This player changed clubs over the summer. Clean sheet and defensive-contribution "
+                    "scoring is always based on their new club (that part is 100% about the team, not the "
+                    "player) - but it's still worth checking the news for anything that changes their "
+                    "role, like losing set-piece duties or facing more competition for a starting spot."),
 }
 
 
@@ -99,6 +131,61 @@ def render_ranked_bar(df, score_col, x_label, sort_mode, n=12):
                  orientation="h", labels={score_col: x_label, "web_name": ""})
     fig.update_yaxes(categoryorder="array", categoryarray=d["web_name"].tolist())
     show(style_bar(fig, len(d)))
+
+
+# Letters that don't decompose via NFKD (they're distinct base letters, not
+# a base + combining accent), so plain accent-stripping silently drops them
+# instead of converting to a sensible ASCII equivalent. Found via testing:
+# "Ødegaard" -> "degaard", dropping the ø entirely - a real bug for a name
+# this well-known to be worth explicitly handling.
+_NON_DECOMPOSING_LETTERS = str.maketrans({
+    "ø": "o", "Ø": "O", "đ": "d", "Đ": "D", "ł": "l", "Ł": "L",
+    "æ": "ae", "Æ": "AE", "œ": "oe", "Œ": "OE", "ß": "ss",
+})
+
+
+def normalize_name(s):
+    """Strips accents and lowercases a name for matching across data
+    sources. Two real bugs this fixes: 'Dominik Szoboszlai' vs a source that
+    spells it with different diacritics ending up as two different players,
+    and letters like ø/đ/ł that NFKD decomposition drops rather than
+    converts (e.g. 'Ødegaard' -> 'degaard' without the explicit table)."""
+    if not isinstance(s, str):
+        return s
+    s = s.translate(_NON_DECOMPOSING_LETTERS)
+    s = unicodedata.normalize("NFKD", s).encode("ascii", "ignore").decode("ascii")
+    return s.lower().strip()
+
+
+def team_short_map(bootstrap):
+    """{team full name: short code}, e.g. {'Arsenal': 'ARS'} - used to bridge
+    live bootstrap data against the historical (vaastav) short-code tables."""
+    return {t["name"]: t["short_name"] for t in bootstrap.get("teams", []) if "short_name" in t}
+
+
+def render_squad_row(rows, muted=False):
+    """Renders a row of player cards for the Squad Optimizer results -
+    colour-coded by position, name/team/price/score at a glance."""
+    if rows.empty:
+        st.caption("(none)")
+        return
+    opacity = "0.55" if muted else "1"
+    cards = []
+    for _, r in rows.sort_values("proj_5gw", ascending=False).iterrows():
+        color = POSITION_COLORS.get(r["position"], "#9ca3af")
+        badge = " 🔁" if r.get("transferred") else ""
+        cards.append(f"""
+        <div style="flex:1; min-width:130px; background:white; border:1px solid #e5e7eb;
+                    border-left:4px solid {color}; border-radius:10px; padding:8px 10px;
+                    opacity:{opacity};">
+          <div style="font-weight:700; font-size:0.85rem; color:#111827;">{r['web_name']}{badge}</div>
+          <div style="font-size:0.72rem; color:#6b7280;">{r['team_name']} · £{r['price']:.1f}m</div>
+          <div style="font-size:0.78rem; color:#374151; margin-top:2px;">{r['proj_5gw']:.1f} pts (5 GW)</div>
+        </div>""")
+    st.markdown(
+        f'<div style="display:flex; flex-wrap:wrap; gap:8px; margin-bottom:10px;">{"".join(cards)}</div>',
+        unsafe_allow_html=True,
+    )
 
 
 def value_basis_picker(key):
@@ -158,6 +245,109 @@ def load_last_season_data():
         return {k: {"points": points[k], "price": price[k] / 10.0} for k in points}
     except Exception:
         return {}
+
+
+@st.cache_data(ttl=86400)
+def load_last_season_team_floor():
+    """Per-club defensive environment from last season: clean sheet rate,
+    defensive-contribution hit rate (separately for defenders and
+    midfielders, since the DefCon threshold and points differ by position),
+    and a goalkeeper scoring floor. This is what actually drives keeper and
+    defender scores in the Squad Optimizer - see DEFINITIONS['optimizer']."""
+    try:
+        gw = pd.read_csv(LAST_SEASON_GW_CSV)
+        teams = pd.read_csv(LAST_SEASON_TEAMS_CSV)
+        fixtures = pd.read_csv(LAST_SEASON_FIXTURES_CSV)
+        fixtures = fixtures[fixtures["finished"] == True]
+
+        id_to_short = dict(zip(teams["id"], teams["short_name"]))
+        home_cs = fixtures.groupby("team_h").apply(lambda d: (d["team_a_score"] == 0).sum(), include_groups=False)
+        away_cs = fixtures.groupby("team_a").apply(lambda d: (d["team_h_score"] == 0).sum(), include_groups=False)
+        home_games, away_games = fixtures.groupby("team_h").size(), fixtures.groupby("team_a").size()
+        cs_total = home_cs.add(away_cs, fill_value=0)
+        games_total = home_games.add(away_games, fill_value=0)
+        cs_df = pd.DataFrame({"short_name": [id_to_short.get(i) for i in cs_total.index],
+                               "cs_rate": (cs_total / games_total).values})
+
+        gw = gw[gw["minutes"] > 0].copy()
+        gw["short_name"] = gw["team"].map(dict(zip(teams["name"], teams["short_name"])))
+
+        def team_dc(position, threshold):
+            sub = gw[gw["position"] == position].copy()
+            sub["hit"] = (sub["defensive_contribution"] >= threshold).astype(int)
+            t = sub.groupby("short_name").agg(games=("hit", "count"), hits=("hit", "sum")).reset_index()
+            t["dc_hit_rate"] = t["hits"] / t["games"]
+            return t[["short_name", "dc_hit_rate"]]
+
+        def_dc = team_dc("DEF", 10).rename(columns={"dc_hit_rate": "def_dc_rate"})
+        mid_dc = team_dc("MID", 12).rename(columns={"dc_hit_rate": "mid_dc_rate"})
+
+        gk = gw[gw["position"] == "GK"].copy()
+        gk["cs_pts"] = gk["clean_sheets"] * 4
+        gk["save_pts"] = (gk["saves"] // 3).astype(int)
+        gk["gc_penalty"] = -(gk["goals_conceded"] // 2).astype(int)
+        gk_agg = gk.groupby("short_name").agg(
+            cs_pts_pg=("cs_pts", "mean"), save_pts_pg=("save_pts", "mean"),
+            gc_penalty_pg=("gc_penalty", "mean"),
+        ).reset_index()
+        gk_agg["gk_floor"] = 2 + gk_agg["cs_pts_pg"] + gk_agg["save_pts_pg"] + gk_agg["gc_penalty_pg"]
+
+        floor = cs_df.merge(def_dc, on="short_name", how="left").merge(mid_dc, on="short_name", how="left")
+        floor = floor.merge(gk_agg[["short_name", "gk_floor"]], on="short_name", how="left")
+        floor["def_floor"] = 2 + 4 * floor["cs_rate"] + 2 * floor["def_dc_rate"].fillna(0)
+        floor["mid_cs_component"] = floor["cs_rate"]
+        floor["exceptional_defense"] = floor["cs_rate"] >= EXCEPTIONAL_CS_RATE
+        return floor.set_index("short_name")
+    except Exception:
+        return pd.DataFrame()
+
+
+@st.cache_data(ttl=86400)
+def load_last_season_decomposition():
+    """Per-player points breakdown from last season - appearance, clean
+    sheets, defensive contribution, and everything else (goals/assists/
+    bonus) - computed match by match, not from season totals. Powers
+    midfielder archetype tagging and personal defensive-contribution rates
+    in the Squad Optimizer."""
+    try:
+        gw = pd.read_csv(LAST_SEASON_GW_CSV)
+        gw = gw[gw["minutes"] > 0].copy()
+        thresholds = {"DEF": 10, "MID": 12, "FWD": 12}
+        gw["dc_threshold"] = gw["position"].map(thresholds).fillna(12)
+        gw["dc_hit"] = (gw["defensive_contribution"] >= gw["dc_threshold"]).astype(int)
+        gw["dc_pts"] = gw["dc_hit"] * 2
+        cs_weight = {"GK": 4, "DEF": 4, "MID": 1, "FWD": 0}
+        gw["cs_pts"] = gw["clean_sheets"] * gw["position"].map(cs_weight).fillna(0)
+        gw["app_pts"] = gw["minutes"].apply(lambda m: 2 if m >= 60 else 1)
+        gw["residual_pts"] = gw["total_points"] - gw["app_pts"] - gw["cs_pts"] - gw["dc_pts"]
+
+        agg = gw.groupby("name").agg(
+            games=("total_points", "count"), mins=("minutes", "sum"),
+            total_pts=("total_points", "sum"), dc_pts=("dc_pts", "sum"),
+            residual_pts=("residual_pts", "sum"), position=("position", "first"),
+            team=("team", "last"),
+        ).reset_index()
+        agg["position"] = agg["position"].replace({"GK": "GKP"})  # match this app's own convention
+        agg = agg[agg["games"] >= 10].copy()
+        agg["dc_share"] = agg["dc_pts"] / agg["total_pts"].replace(0, np.nan)
+        agg["residual_share"] = agg["residual_pts"] / agg["total_pts"].replace(0, np.nan)
+        agg["personal_dc_pg"] = agg["dc_pts"] / agg["games"]
+        agg["personal_att_pg"] = agg["residual_pts"] / agg["games"]
+
+        def archetype(r):
+            if r["position"] != "MID":
+                return ""
+            if r["dc_share"] >= 0.20 and r["residual_share"] < 0.30:
+                return "Defensive"
+            if r["residual_share"] >= 0.45 and r["dc_share"] < 0.12:
+                return "Attacking"
+            return "Hybrid"
+
+        agg["archetype"] = agg.apply(archetype, axis=1)
+        agg["norm_name"] = agg["name"].apply(normalize_name)
+        return agg.drop_duplicates(subset="norm_name").set_index("norm_name")
+    except Exception:
+        return pd.DataFrame()
 
 
 # ---------------------------------------------------------------------------
@@ -364,6 +554,165 @@ def season_comparison_df(players_df):
     df["value_delta"] = df["value_now"] - df["value_then"]
     df["price_delta"] = (df["price"] - df["last_season_price"]).round(1)
     return df
+
+
+# ---------------------------------------------------------------------------
+# Squad Optimizer - scoring
+# ---------------------------------------------------------------------------
+def build_optimizer_pool(bootstrap, players_df, team_floor, decomposition, fixture_lookup):
+    """Builds the composite 5-gameweek score the optimizer maximises.
+
+    GKP/DEF lean almost entirely on their club's last-season defensive
+    environment (clean sheets + defensive-contribution rate), since that's
+    what actually drives their points. MID splits into personal defensive-
+    contribution rate + personal attacking rate + a small team clean-sheet
+    component. FWD is pure attacking rate, since forwards essentially never
+    reach the defensive-contribution threshold.
+
+    Players who changed clubs over the summer get their clean-sheet and
+    defensive-contribution components re-based to the NEW club rather than
+    trusting stale history from the old one - team context, not personal
+    history, drives those two components. Attacking rate stays personal
+    either way, since that's the more individually portable skill.
+    """
+    elements = pd.DataFrame(bootstrap["elements"])[["id", "first_name", "second_name"]]
+    df = players_df.merge(elements, on="id", how="left")
+    df["norm_name"] = (df["first_name"].fillna("") + " " + df["second_name"].fillna("")).apply(normalize_name)
+    df["norm_surname"] = df["second_name"].fillna("").apply(normalize_name)
+
+    df["team_short"] = df["team_name"].map(team_short_map(bootstrap))
+    df = df.merge(team_floor, left_on="team_short", right_index=True, how="left")
+
+    dec_cols = ["personal_dc_pg", "personal_att_pg", "archetype", "team", "mins", "total_pts", "position"]
+    rename_map = {"team": "last_team_full", "mins": "ls_mins", "total_pts": "ls_pts", "position": "ls_position"}
+    dec = decomposition.reset_index()[["norm_name"] + dec_cols].rename(columns=rename_map)
+    df = df.merge(dec, on="norm_name", how="left")
+
+    # Fallback pass: real player names sometimes carry an extra surname in
+    # the historical data (e.g. "David Raya Martín" vs this season's "David
+    # Raya") that a straight full-name match misses. For anyone still
+    # unmatched, try surname-is-contained-in-full-name + same position, and
+    # only accept it if exactly one candidate qualifies - ambiguous matches
+    # are left unmatched rather than risk attributing the wrong player's
+    # history to someone.
+    unmatched = df[df["ls_mins"].isna() & (df["norm_surname"] != "")]
+    for idx, row in unmatched.iterrows():
+        candidates = dec[
+            dec["norm_name"].str.contains(row["norm_surname"], regex=False, na=False)
+            & (dec["ls_position"] == row["position"])
+        ]
+        if len(candidates) == 1:
+            for col in rename_map.values():
+                df.at[idx, col] = candidates.iloc[0][col]
+
+    df["transferred"] = df["last_team_full"].notna() & (df["last_team_full"] != df["team_name"])
+
+    mean_fdr = float(np.mean(list(fixture_lookup.values()))) if fixture_lookup else 3.0
+    df["fixture_mult"] = 1 + (mean_fdr - df["team_name"].map(fixture_lookup).fillna(mean_fdr)) / 8.0
+    df["reliability"] = (df["ls_mins"].fillna(0) / RELIABILITY_MINUTES_CAP).clip(upper=1.0)
+    df["avail_mult"] = np.where(df["status"] == "d", 0.85, 1.0)
+
+    def score_row(r):
+        if r["status"] in ("i", "s", "u"):
+            return 0.0
+        if r["position"] == "GKP":
+            base = r["gk_floor"] if pd.notna(r.get("gk_floor")) else 2.5
+        elif r["position"] == "DEF":
+            base = r["def_floor"] if pd.notna(r.get("def_floor")) else 3.0
+        elif r["position"] == "MID":
+            cs_c = r["mid_cs_component"] if pd.notna(r.get("mid_cs_component")) else 0.3
+            if r["transferred"] or pd.isna(r.get("personal_dc_pg")):
+                dc_c = 2 * r["mid_dc_rate"] if pd.notna(r.get("mid_dc_rate")) else 0.3
+            else:
+                dc_c = r["personal_dc_pg"]
+            att = r["personal_att_pg"] if pd.notna(r.get("personal_att_pg")) else 0.5
+            base = 2 + cs_c + dc_c + att
+        else:
+            base = (r["ls_pts"] / r["ls_mins"] * 90) if (pd.notna(r.get("ls_pts")) and r.get("ls_mins")) else 0.0
+        return round(base * r["reliability"] * r["fixture_mult"] * r["avail_mult"], 3)
+
+    df["proj_score_per_gw"] = df.apply(score_row, axis=1)
+    df["proj_5gw"] = (df["proj_score_per_gw"] * 5).round(2)
+    return df
+
+
+def optimize_squad(pool, budget=100.0, locked_start=None, locked_bench=None, excluded=None,
+                    exceptional_teams=None, bench_min_mins=BENCH_SAFE_MINUTES):
+    """Two-tier squad optimizer: maximise the STARTING XI's projected score
+    (not the full 15), since bench points don't count on a normal week.
+    Non-locked bench slots must clear a last-season minutes threshold, so
+    the model doesn't fill your bench with complete unknowns purely because
+    they're cheap - unless you've explicitly locked them there yourself
+    (e.g. a promoted-team player with no PL history but strong lower-league
+    evidence, which the model has no way to see)."""
+    locked_start, locked_bench = locked_start or [], locked_bench or []
+    excluded, exceptional_teams = excluded or [], exceptional_teams or []
+
+    df = pool[~pool["status"].isin(["i", "s", "u"])].copy()
+    df = df[~df["web_name"].isin(excluded)]
+    df = df.dropna(subset=["proj_5gw", "price", "position", "team_name"]).reset_index(drop=True)
+    if df.empty:
+        return None, "No eligible players"
+    df["price_tenths"] = (df["price"] * 10).round().astype(int)
+    df["ls_mins"] = df["ls_mins"].fillna(0)
+    df["score_int"] = (df["proj_5gw"] * 100).round().astype(int)
+
+    def first_index(name):
+        matches = df.index[df["web_name"] == name]
+        return matches[0] if len(matches) else None
+
+    start_idx = [i for i in (first_index(n) for n in locked_start) if i is not None]
+    bench_idx = [i for i in (first_index(n) for n in locked_bench) if i is not None]
+    exempt = set(bench_idx)
+    teams = df["team_name"].unique()
+
+    prob = pulp.LpProblem("gaffer_optimizer", pulp.LpMaximize)
+    x = {i: pulp.LpVariable(f"squad_{i}", cat="Binary") for i in df.index}
+    y = {i: pulp.LpVariable(f"start_{i}", cat="Binary") for i in df.index}
+
+    prob += pulp.lpSum(df["score_int"][i] * y[i] for i in df.index)
+    prob += pulp.lpSum(x.values()) == 15
+    prob += pulp.lpSum(df["price_tenths"][i] * x[i] for i in df.index) <= int(round(budget * 10))
+    for pos, n in SQUAD_RULES.items():
+        prob += pulp.lpSum(x[i] for i in df.index if df["position"][i] == pos) == n
+    for t in teams:
+        prob += pulp.lpSum(x[i] for i in df.index if df["team_name"][i] == t) <= 3
+        def_cap = 3 if t in exceptional_teams else 1
+        prob += pulp.lpSum(x[i] for i in df.index
+                            if df["team_name"][i] == t and df["position"][i] == "DEF") <= def_cap
+    prob += pulp.lpSum(y.values()) == 11
+    for pos, lo in FORMATION_MIN.items():
+        prob += pulp.lpSum(y[i] for i in df.index if df["position"][i] == pos) >= lo
+    for pos, hi in FORMATION_MAX.items():
+        prob += pulp.lpSum(y[i] for i in df.index if df["position"][i] == pos) <= hi
+    for i in df.index:
+        prob += y[i] <= x[i]
+        if i not in exempt:
+            prob += df["ls_mins"][i] >= bench_min_mins * (x[i] - y[i])
+    for i in start_idx:
+        prob += x[i] == 1
+        prob += y[i] == 1
+    for i in bench_idx:
+        prob += x[i] == 1
+        prob += y[i] == 0
+
+    solve_status = prob.solve(pulp.PULP_CBC_CMD(msg=0))
+    status_label = pulp.LpStatus[solve_status]
+    if status_label != "Optimal":
+        return None, status_label
+
+    chosen = [i for i in df.index if x[i].value() == 1]
+    starting = [i for i in df.index if y[i].value() == 1]
+    squad = df.loc[chosen].copy()
+    squad["starting"] = squad.index.isin(starting)
+    squad = squad.sort_values(["starting", "position", "proj_5gw"], ascending=[False, True, False])
+    return squad, status_label
+
+
+def squad_formation(squad):
+    starters = squad[squad["starting"]]
+    counts = starters["position"].value_counts()
+    return f"{counts.get('DEF', 0)}-{counts.get('MID', 0)}-{counts.get('FWD', 0)}"
 
 
 # ---------------------------------------------------------------------------
@@ -574,8 +923,9 @@ if filtered_raw.empty:
 # ---------------------------------------------------------------------------
 # Tabs
 # ---------------------------------------------------------------------------
-tab_squad, tab_scatter, tab_smart, tab_value, tab_fixtures, tab_compare, tab_watchlist = st.tabs(
-    ["My Squad", "Value Scatter", "Smart Picks", "Top Value", "Fixtures",
+(tab_squad, tab_optimizer, tab_scatter, tab_smart, tab_value, tab_fixtures, tab_compare,
+ tab_watchlist) = st.tabs(
+    ["My Squad", "🧮 Optimizer", "Value Scatter", "Smart Picks", "Top Value", "Fixtures",
      "Season Compare", "Watchlist"]
 )
 
@@ -607,6 +957,97 @@ with tab_squad:
             st.caption("No clear upgrades found within budget.")
     else:
         st.info("Switch to Live mode with your entry ID to see your squad here.")
+
+with tab_optimizer:
+    st.caption(DEFINITIONS["optimizer"])
+    if data_mode != "Live":
+        st.info("Switch to Live mode to build a real squad - the optimizer needs live prices, "
+                "team news, and this season's fixtures.")
+    else:
+        team_floor = load_last_season_team_floor()
+        decomposition = load_last_season_decomposition()
+        if team_floor.empty or decomposition.empty:
+            st.warning("Couldn't load last season's gameweek data right now - try again shortly.")
+        else:
+            pool = build_optimizer_pool(bootstrap, raw_players_df, team_floor, decomposition, fixture_lookup)
+            exceptional_teams = [
+                name for name, short in team_short_map(bootstrap).items()
+                if short in team_floor.index and team_floor.loc[short, "exceptional_defense"]
+            ]
+            all_names = sorted(pool["web_name"].dropna().unique())
+
+            with st.expander("⚙️ Optimizer settings", expanded=True):
+                budget = st.slider("Budget (£m)", 80.0, 105.0, 100.0, step=0.5)
+                st.markdown("**Lock players in** (optional)")
+                c1, c2 = st.columns(2)
+                with c1:
+                    lock_start = st.multiselect(
+                        "Must start", all_names, key="opt_lock_start",
+                        help="These players are guaranteed a place in your starting XI.")
+                with c2:
+                    lock_bench = st.multiselect(
+                        "Keep on the bench", all_names, key="opt_lock_bench",
+                        help="For players you want in the squad but not scored as a starter - e.g. a "
+                             "promoted-team player with no PL history yet but strong lower-league form.")
+                exclude = st.multiselect("Never consider", all_names, key="opt_exclude")
+                st.caption(DEFINITIONS["exceptional_defense"])
+                if exceptional_teams:
+                    st.caption(f"Currently exceptional: {', '.join(exceptional_teams)}")
+                allow_stacking = st.multiselect(
+                    "Also allow 2+ defenders from (beyond the automatic list above)",
+                    sorted(pool["team_name"].dropna().unique()), key="opt_extra_stack")
+                bench_min_mins = st.slider(
+                    "Minimum last-season minutes for an unlocked bench spot", 0, 3000, BENCH_SAFE_MINUTES,
+                    step=100, help="Stops the optimizer filling your bench with complete unknowns purely "
+                                   "because they're cheap. Lower this if you want more speculative bench picks.")
+
+            run = st.button("🧮 Optimize Squad", type="primary", width="stretch")
+            if run:
+                with st.spinner("Solving..."):
+                    squad, status_label = optimize_squad(
+                        pool, budget=budget, locked_start=lock_start, locked_bench=lock_bench,
+                        excluded=exclude, exceptional_teams=exceptional_teams + allow_stacking,
+                        bench_min_mins=bench_min_mins,
+                    )
+                st.session_state["optimizer_result"] = (squad, status_label)
+
+            result = st.session_state.get("optimizer_result")
+            if result is None:
+                st.caption("Set your options above and hit Optimize Squad.")
+            else:
+                squad, status_label = result
+                if squad is None:
+                    st.error(f"No valid squad found ({status_label}). Try loosening a constraint - "
+                              "budget, locked players, and 'never consider' can all conflict with each other.")
+                else:
+                    starters, bench = squad[squad["starting"]], squad[~squad["starting"]]
+                    m1, m2, m3, m4 = st.columns(4)
+                    m1.metric("Cost", f"£{squad['price'].sum():.1f}m")
+                    m2.metric("In the bank", f"£{budget - squad['price'].sum():.1f}m")
+                    m3.metric("Formation", squad_formation(squad))
+                    m4.metric("Projected (5 GW)", f"{starters['proj_5gw'].sum():.0f} pts")
+
+                    st.markdown("#### Starting XI")
+                    for pos in POSITION_ORDER:
+                        rows = starters[starters["position"] == pos]
+                        if rows.empty:
+                            continue
+                        render_squad_row(rows)
+
+                    st.markdown("#### Bench")
+                    render_squad_row(bench, muted=True)
+
+                    transferred_in_squad = squad[squad["transferred"] == True]
+                    if not transferred_in_squad.empty:
+                        with st.expander(f"↔️ {len(transferred_in_squad)} player(s) in this squad changed clubs"):
+                            st.caption(DEFINITIONS["transferred"])
+                            for _, r in transferred_in_squad.iterrows():
+                                st.markdown(f"- **{r['web_name']}**: {r['last_team_full']} → {r['team_name']}")
+
+                    csv = squad[["web_name", "position", "team_name", "price", "proj_5gw", "starting"]].rename(
+                        columns={"proj_5gw": "projected_5gw_pts"})
+                    st.download_button("Download squad as CSV", csv.to_csv(index=False),
+                                        "gaffer_squad.csv", "text/csv")
 
 with tab_scatter:
     mode, mode_label = value_basis_picker("scatter_value_mode")

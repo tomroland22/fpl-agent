@@ -3,3 +3,4 @@ pandas>=2.0
 numpy>=1.24
 streamlit>=1.38
 plotly>=5.22
+pulp>=2.8
