@@ -86,13 +86,14 @@ def style_fig(fig, height=440, show_legend=True):
     fig.update_layout(
         template="plotly_white",
         title=dict(text="", font=dict(family=FONT, size=15, color="#111827")),
-        font=dict(family=FONT, size=12, color="#374151"),
+        font=dict(family=FONT, size=13, color="#374151"),
         margin=dict(l=8, r=8, t=40, b=8),
         height=height,
         showlegend=show_legend,
         legend=dict(orientation="h", yanchor="bottom", y=1.0, xanchor="right", x=1,
-                    font=dict(size=11), title=dict(text="")),
-        hoverlabel=dict(bgcolor="white", font_size=12, bordercolor="#e5e7eb"),
+                    font=dict(size=12), title=dict(text="")),
+        hoverlabel=dict(bgcolor="white", font_size=13, font_family=FONT, bordercolor="#d1d5db",
+                         align="left"),
         plot_bgcolor="white", paper_bgcolor="white",
     )
     fig.update_xaxes(showgrid=True, gridcolor="#f3f4f6", zeroline=False, linecolor="#e5e7eb")
@@ -102,11 +103,11 @@ def style_fig(fig, height=440, show_legend=True):
 
 def style_bar(fig, n_items=10):
     fig.update_traces(marker_line_width=0)
-    return style_fig(fig, height=90 + 34 * max(n_items, 1), show_legend=False)
+    return style_fig(fig, height=110 + 40 * max(n_items, 1), show_legend=False)
 
 
 def style_scatter(fig, height=520):
-    fig.update_traces(marker=dict(size=9, opacity=0.75, line=dict(width=0.5, color="white")))
+    fig.update_traces(marker=dict(size=10, opacity=0.8, line=dict(width=0.5, color="white")))
     return style_fig(fig, height=height)
 
 
@@ -115,9 +116,44 @@ def show(fig):
     st.plotly_chart(fig, width="stretch", config={"displayModeBar": False})
 
 
-def render_ranked_bar(df, score_col, x_label, sort_mode, n=12):
+def apply_hover(fig, df, spec):
+    """Replaces Plotly's default hover box (raw column names, unformatted
+    numbers - the 'looks like code' problem) with a clean, labelled one.
+
+    spec: list of (label, column, formatter) tuples. First entry is always
+    shown bold with no label (the player's name); everything after gets a
+    label and its own formatter, e.g. ("Price", "price", lambda v: f"£{v:.1f}m").
+    Every chart in the app uses the same core fields (name, team, position,
+    price, owned) plus whatever's specific to that chart, so the tooltip
+    always answers 'who is this and where do they play' first.
+    """
+    cols = [df[col].apply(fmt) for _, col, fmt in spec]
+    customdata = np.stack([c.to_numpy() for c in cols], axis=-1)
+    lines = ["<b>%{customdata[0]}</b>"]
+    for i, (label, _, _) in enumerate(spec[1:], start=1):
+        lines.append(f"{label}: %{{customdata[{i}]}}")
+    fig.update_traces(customdata=customdata, hovertemplate="<br>".join(lines) + "<extra></extra>")
+    return fig
+
+
+def core_hover_spec(extra=None):
+    """The fields every chart's tooltip should carry, regardless of what
+    metric is actually being plotted - name, team, position, price, owned.
+    `extra` appends chart-specific fields (e.g. the score being ranked on)."""
+    spec = [
+        ("", "web_name", lambda v: v),
+        ("Team", "team_name", lambda v: v),
+        ("Position", "position", lambda v: v),
+        ("Price", "price", lambda v: f"£{v:.1f}m"),
+        ("Owned", "selected_by_percent", lambda v: f"{v:.1f}%" if pd.notna(v) else "-"),
+    ]
+    return spec + (extra or [])
+
+
+def render_ranked_bar(df, score_col, x_label, sort_mode, n=12, score_fmt=None):
     """Shared renderer for every 'top N players by some score' bar chart,
-    with the Score/Position sort toggle applied consistently."""
+    with the Score/Position sort toggle applied consistently and a full,
+    readable tooltip (name, team, position, price, ownership, the score)."""
     d = df.nlargest(n, score_col).copy()
     if d.empty:
         st.caption("Not enough data for this view yet.")
@@ -127,9 +163,11 @@ def render_ranked_bar(df, score_col, x_label, sort_mode, n=12):
         d = d.sort_values(["position", score_col])
     else:
         d = d.sort_values(score_col)
+    score_fmt = score_fmt or (lambda v: f"{v:.1f}")
     fig = px.bar(d, x=score_col, y="web_name", color="position", color_discrete_map=POSITION_COLORS,
                  orientation="h", labels={score_col: x_label, "web_name": ""})
     fig.update_yaxes(categoryorder="array", categoryarray=d["web_name"].tolist())
+    apply_hover(fig, d, core_hover_spec([(x_label, score_col, score_fmt)]))
     show(style_bar(fig, len(d)))
 
 
@@ -390,7 +428,9 @@ def team_upcoming_fixtures(fixtures, teams_map, team_id, current_event, n=3):
         elif f["team_a"] == team_id:
             rows.append({"event": ev, "opponent": teams_map.get(f["team_h"], "?"),
                          "venue": "Away", "difficulty": f["team_a_difficulty"]})
-    return pd.DataFrame(rows).sort_values("event").head(n).reset_index(drop=True)
+    out = pd.DataFrame(rows).sort_values("event").head(n).reset_index(drop=True)
+    return out.rename(columns={"event": "GW", "opponent": "Opponent", "venue": "Venue",
+                                "difficulty": "Difficulty"})
 
 
 # ---------------------------------------------------------------------------
@@ -797,7 +837,7 @@ def generate_demo_team_fixtures(team_name):
     venues = rng.choice(["Home", "Away"], 3)
     diffs = rng.integers(1, 6, 3)
     events = [12, 13, 14]
-    return pd.DataFrame({"event": events, "opponent": opponents, "venue": venues, "difficulty": diffs})
+    return pd.DataFrame({"GW": events, "Opponent": opponents, "Venue": venues, "Difficulty": diffs})
 
 
 # ---------------------------------------------------------------------------
@@ -923,10 +963,8 @@ if filtered_raw.empty:
 # ---------------------------------------------------------------------------
 # Tabs
 # ---------------------------------------------------------------------------
-(tab_squad, tab_optimizer, tab_scatter, tab_smart, tab_value, tab_fixtures, tab_compare,
- tab_watchlist) = st.tabs(
-    ["My Squad", "🧮 Optimizer", "Value Scatter", "Smart Picks", "Top Value", "Fixtures",
-     "Season Compare", "Watchlist"]
+(tab_squad, tab_optimizer, tab_explorer, tab_fixtures, tab_compare, tab_watchlist) = st.tabs(
+    ["My Squad", "🧮 Optimizer", "🔍 Explorer", "Fixtures", "Season Compare", "Watchlist"]
 )
 
 with tab_squad:
@@ -945,14 +983,24 @@ with tab_squad:
 
         st.dataframe(
             squad_df[["web_name", "position", "team_name", "price", "value_basis",
-                      "selected_by_percent", "status", "role"]].rename(
-                columns={"value_basis": f"Value ({mode_label})", "selected_by_percent": "Owned %"}),
+                      "selected_by_percent", "status", "role"]].rename(columns={
+                "web_name": "Player", "position": "Pos", "team_name": "Team", "price": "Price (£m)",
+                "value_basis": f"Value ({mode_label})", "selected_by_percent": "Owned %",
+                "status": "Status", "role": "Role",
+            }),
             width="stretch", hide_index=True,
         )
         suggestions = suggest_transfers(squad_df, players_df_full, bank, fixture_lookup)
         if not suggestions.empty:
             st.markdown(f"**Possible upgrades** (bank: £{bank}m, fixtures factored in)")
-            st.dataframe(suggestions, width="stretch", hide_index=True)
+            st.dataframe(
+                suggestions.rename(columns={
+                    "out": "Transfer out", "out_pts": "Their value",
+                    "in": "Transfer in", "in_pts": "New value",
+                    "in_price": "Price (£m)", "cost_change": "Cost change (£m)",
+                }),
+                width="stretch", hide_index=True,
+            )
         else:
             st.caption("No clear upgrades found within budget.")
     else:
@@ -1049,40 +1097,65 @@ with tab_optimizer:
                     st.download_button("Download squad as CSV", csv.to_csv(index=False),
                                         "gaffer_squad.csv", "text/csv")
 
-with tab_scatter:
-    mode, mode_label = value_basis_picker("scatter_value_mode")
+with tab_explorer:
+    mode, mode_label = value_basis_picker("explorer_value_mode")
     filtered = apply_value_basis(filtered_raw, mode)
-    view = st.radio("View", ["Price vs Ownership", "Price vs Points"], horizontal=True)
-    st.caption(DEFINITIONS["price_vs_ownership" if view == "Price vs Ownership" else "price_vs_points"])
-    if view == "Price vs Ownership":
-        fig = px.scatter(
-            filtered, x="price", y="selected_by_percent", color="position",
-            color_discrete_map=POSITION_COLORS,
-            hover_data=["web_name", "team_name", "value_basis", "reliability"],
-            labels={"price": "Price (£m)", "selected_by_percent": "Selected by (%)"},
-        )
-        y_col = "selected_by_percent"
-    else:
-        fig = px.scatter(
-            filtered.dropna(subset=["value_basis"]), x="price", y="value_basis", color="position",
-            color_discrete_map=POSITION_COLORS,
-            hover_data=["web_name", "team_name", "selected_by_percent", "reliability"],
-            labels={"price": "Price (£m)", "value_basis": f"Value ({mode_label})"},
-        )
-        y_col = "value_basis"
-    if squad_names:
-        owned = filtered[filtered["web_name"].isin(squad_names)]
-        fig.add_scatter(
-            x=owned["price"], y=owned[y_col], mode="markers",
-            marker=dict(size=15, color="rgba(0,0,0,0)", line=dict(color="black", width=2)),
-            name="Your squad", hoverinfo="skip",
-        )
-    show(style_scatter(fig))
+    view = st.selectbox(
+        "View", ["Scatter", "Top Value", "Overpriced", "Underpriced", "Overowned", "Underowned"],
+        help="Different lenses on the same underlying value calculation - pick whichever answers "
+             "the question you actually have.")
 
+    if view == "Scatter":
+        axis = st.radio("Axes", ["Price vs Ownership", "Price vs Points"], horizontal=True)
+        st.caption(DEFINITIONS["price_vs_ownership" if axis == "Price vs Ownership" else "price_vs_points"])
+        if axis == "Price vs Ownership":
+            fig = px.scatter(
+                filtered, x="price", y="selected_by_percent", color="position",
+                color_discrete_map=POSITION_COLORS,
+                labels={"price": "Price (£m)", "selected_by_percent": "Selected by (%)"},
+            )
+            apply_hover(fig, filtered, core_hover_spec(
+                [(f"Value ({mode_label})", "value_basis", lambda v: f"{v:.0f} pts" if pd.notna(v) else "-")]))
+            y_col = "selected_by_percent"
+        else:
+            pts_df = filtered.dropna(subset=["value_basis"])
+            fig = px.scatter(
+                pts_df, x="price", y="value_basis", color="position",
+                color_discrete_map=POSITION_COLORS,
+                labels={"price": "Price (£m)", "value_basis": f"Value ({mode_label})"},
+            )
+            apply_hover(fig, pts_df, core_hover_spec())
+            y_col = "value_basis"
+        if squad_names:
+            owned = filtered[filtered["web_name"].isin(squad_names)]
+            fig.add_scatter(
+                x=owned["price"], y=owned[y_col], mode="markers",
+                marker=dict(size=15, color="rgba(0,0,0,0)", line=dict(color="black", width=2)),
+                name="Your squad", hoverinfo="skip",
+            )
+        show(style_scatter(fig))
+
+    elif view == "Top Value":
+        st.caption(f"Points per £m, using {mode_label.lower()} points. Best bargains in the pool right now.")
+        sort_mode = st.radio("Sort by", ["Score", "Position"], horizontal=True, key="value_sort")
+        render_ranked_bar(top_value_picks(filtered, n=15), "value_per_million", "Points / £m", sort_mode, n=15,
+                           score_fmt=lambda v: f"{v:.1f} pts/£m")
+
+    else:
+        st.caption("Ranked within position, so a GKP is only compared to other GKPs.")
+        sort_mode = st.radio("Sort by", ["Score", "Position"], horizontal=True, key="smart_sort")
+        st.info(DEFINITIONS[view.lower()])
+        scored = add_percentiles(filtered)
+        score_col = {"Overpriced": "overpriced_score", "Underpriced": "underpriced_score",
+                     "Overowned": "overowned_score", "Underowned": "underowned_score"}[view]
+        render_ranked_bar(scored.dropna(subset=[score_col]), score_col, "Score (higher = more so)", sort_mode,
+                           score_fmt=lambda v: f"{v:+.0f}")
+
+    st.divider()
     st.markdown("**Player detail**")
     detail_options = filtered.sort_values("selected_by_percent", ascending=False)["web_name"].tolist()
     if detail_options:
-        picked = st.selectbox("Select a player", detail_options, key="scatter_detail_pick")
+        picked = st.selectbox("Select a player", detail_options, key="explorer_detail_pick")
         row = filtered[filtered["web_name"] == picked].iloc[0]
         c1, c2, c3, c4 = st.columns(4)
         c1.metric("Team", row["team_name"])
@@ -1101,25 +1174,6 @@ with tab_scatter:
             st.caption("Next 3 fixtures (difficulty: 1 easy - 5 hard)")
             st.dataframe(fx, width="stretch", hide_index=True)
 
-with tab_smart:
-    mode, mode_label = value_basis_picker("smart_value_mode")
-    filtered = apply_value_basis(filtered_raw, mode)
-    st.caption("Ranked within position, so a GKP is only compared to other GKPs.")
-    sort_mode = st.radio("Sort by", ["Score", "Position"], horizontal=True, key="smart_sort")
-    pick = st.radio("View", ["Overpriced", "Underpriced", "Overowned", "Underowned"], horizontal=True)
-    st.info(DEFINITIONS[pick.lower()])
-    scored = add_percentiles(filtered)
-    score_col = {"Overpriced": "overpriced_score", "Underpriced": "underpriced_score",
-                 "Overowned": "overowned_score", "Underowned": "underowned_score"}[pick]
-    render_ranked_bar(scored.dropna(subset=[score_col]), score_col, "Score (higher = more so)", sort_mode)
-
-with tab_value:
-    mode, mode_label = value_basis_picker("topvalue_value_mode")
-    filtered = apply_value_basis(filtered_raw, mode)
-    st.caption(f"Points per £m, using {mode_label.lower()} points. Best bargains in the pool right now.")
-    sort_mode = st.radio("Sort by", ["Score", "Position"], horizontal=True, key="value_sort")
-    render_ranked_bar(top_value_picks(filtered, n=15), "value_per_million", "Points / £m", sort_mode, n=15)
-
 with tab_fixtures:
     st.caption("Team-level fixture difficulty (1 easy - 5 hard), and FPL's own points forecast "
                "for the next gameweek.")
@@ -1136,6 +1190,12 @@ with tab_fixtures:
                      labels={"avg_difficulty": f"Avg difficulty (next {n_gw} GWs)", "team_name": ""})
         fig.update_yaxes(categoryorder="array", categoryarray=fixture_diff_n["team_name"].tolist())
         fig.update_layout(coloraxis_showscale=False)
+        fig.update_traces(
+            customdata=np.stack([fixture_diff_n["team_name"], fixture_diff_n["avg_difficulty"].round(1),
+                                  fixture_diff_n["fixtures_count"]], axis=-1),
+            hovertemplate="<b>%{customdata[0]}</b><br>Avg difficulty: %{customdata[1]} / 5"
+                          "<br>Fixtures counted: %{customdata[2]}<extra></extra>",
+        )
         show(style_bar(fig, len(fixture_diff_n)))
         st.caption("Lower = easier run. Feeds into the transfer suggestions on My Squad.")
 
@@ -1156,7 +1216,8 @@ with tab_fixtures:
     if ep_pool.empty:
         st.caption("FPL hasn't published next-gameweek projections yet - check back closer to the deadline.")
     else:
-        render_ranked_bar(ep_pool, "ep_next", "Expected pts", "Score", n=10)
+        render_ranked_bar(ep_pool, "ep_next", "Expected pts", "Score", n=10,
+                           score_fmt=lambda v: f"{v:.1f} pts")
 
 with tab_compare:
     st.caption("Last season vs this season, side by side - price then vs now, points paced to a "
@@ -1168,9 +1229,14 @@ with tab_compare:
     if comp_sorted.empty:
         st.caption("Not enough data yet.")
     else:
-        fig = px.bar(comp_sorted.sort_values("value_delta"), x="value_delta", y="web_name",
+        d = comp_sorted.sort_values("value_delta")
+        fig = px.bar(d, x="value_delta", y="web_name",
                      color="position", color_discrete_map=POSITION_COLORS, orientation="h",
                      labels={"value_delta": "Value change (pts/£m)", "web_name": ""})
+        apply_hover(fig, d, core_hover_spec([
+            ("Value then", "value_then", lambda v: f"{v:.1f} pts/£m" if pd.notna(v) else "-"),
+            ("Value now", "value_now", lambda v: f"{v:.1f} pts/£m" if pd.notna(v) else "-"),
+        ]))
         show(style_bar(fig, len(comp_sorted)))
 
     st.markdown("**Look up a player**")
@@ -1193,9 +1259,11 @@ with tab_watchlist:
     if new_players.empty:
         st.caption("No unmatched players currently in the pool.")
     else:
-        fig = px.bar(new_players.sort_values("selected_by_percent"), x="selected_by_percent", y="web_name",
-                     color="position", color_discrete_map=POSITION_COLORS, orientation="h",
+        d = new_players.sort_values("selected_by_percent")
+        fig = px.bar(d, x="selected_by_percent", y="web_name", orientation="h",
+                     color="position", color_discrete_map=POSITION_COLORS,
                      labels={"selected_by_percent": "Owned (%)", "web_name": ""})
+        apply_hover(fig, d, core_hover_spec())
         show(style_bar(fig, len(new_players)))
 
     st.divider()
@@ -1206,7 +1274,7 @@ with tab_watchlist:
         st.caption("No price movement recorded yet.")
     else:
         render_ranked_bar(movers[movers["cost_change_start"] > 0], "cost_change_start",
-                          "Price change (£m)", "Score", n=8)
+                          "Price change (£m)", "Score", n=8, score_fmt=lambda v: f"+£{v:.1f}m")
 
     st.divider()
     st.markdown("**Player history this season**")
@@ -1222,9 +1290,15 @@ with tab_watchlist:
                     st.caption("No gameweek history yet this season.")
                 else:
                     fig_p = px.bar(hist, x="gameweek", y="points", labels={"gameweek": "GW", "points": "Points"})
+                    fig_p.update_traces(
+                        customdata=np.stack([hist["minutes"]], axis=-1),
+                        hovertemplate=f"<b>{picked_name}</b><br>GW %{{x}}: %{{y}} pts"
+                                      "<br>Minutes played: %{customdata[0]}<extra></extra>",
+                    )
                     show(style_bar(fig_p, 6))
                     fig_price = px.line(hist, x="gameweek", y="price",
                                          labels={"gameweek": "GW", "price": "Price (£m)"})
+                    fig_price.update_traces(hovertemplate=f"<b>{picked_name}</b><br>GW %{{x}}: £%{{y}}m<extra></extra>")
                     show(style_fig(fig_price, height=280, show_legend=False))
             except Exception as e:
                 st.caption(f"Couldn't load history: {e}")
