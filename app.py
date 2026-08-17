@@ -85,19 +85,21 @@ DEFINITIONS = {
 def style_fig(fig, height=440, show_legend=True):
     fig.update_layout(
         template="plotly_white",
-        title=dict(text="", font=dict(family=FONT, size=15, color="#111827")),
-        font=dict(family=FONT, size=13, color="#374151"),
+        title=dict(text="", font=dict(family=FONT, size=15, color="#000000")),
+        font=dict(family=FONT, size=13, color="#000000"),
         margin=dict(l=8, r=8, t=40, b=8),
         height=height,
         showlegend=show_legend,
         legend=dict(orientation="h", yanchor="bottom", y=1.0, xanchor="right", x=1,
-                    font=dict(size=12), title=dict(text="")),
-        hoverlabel=dict(bgcolor="white", font_size=13, font_family=FONT, bordercolor="#d1d5db",
-                         align="left"),
+                    font=dict(size=12, color="#000000"), title=dict(text="")),
+        hoverlabel=dict(bgcolor="white", font_size=13, font_family=FONT, font_color="#000000",
+                         bordercolor="#9ca3af", align="left"),
         plot_bgcolor="white", paper_bgcolor="white",
     )
-    fig.update_xaxes(showgrid=True, gridcolor="#f3f4f6", zeroline=False, linecolor="#e5e7eb")
-    fig.update_yaxes(showgrid=False, zeroline=False, linecolor="#e5e7eb")
+    fig.update_xaxes(showgrid=True, gridcolor="#e5e7eb", zeroline=False, linecolor="#9ca3af",
+                      tickfont=dict(color="#000000"), title_font=dict(color="#000000"))
+    fig.update_yaxes(showgrid=False, zeroline=False, linecolor="#9ca3af",
+                      tickfont=dict(color="#000000"), title_font=dict(color="#000000"))
     return fig
 
 
@@ -116,24 +118,36 @@ def show(fig):
     st.plotly_chart(fig, width="stretch", config={"displayModeBar": False})
 
 
-def apply_hover(fig, df, spec):
-    """Replaces Plotly's default hover box (raw column names, unformatted
-    numbers - the 'looks like code' problem) with a clean, labelled one.
+def hover_columns(df, spec):
+    """Pre-formats hover text into real dataframe columns and returns
+    (df_with_hover_columns, column_names_for_custom_data, hovertemplate).
 
-    spec: list of (label, column, formatter) tuples. First entry is always
-    shown bold with no label (the player's name); everything after gets a
-    label and its own formatter, e.g. ("Price", "price", lambda v: f"£{v:.1f}m").
-    Every chart in the app uses the same core fields (name, team, position,
-    price, owned) plus whatever's specific to that chart, so the tooltip
-    always answers 'who is this and where do they play' first.
+    This has to happen BEFORE the chart is built, with the column names
+    passed into px.scatter/px.bar's own `custom_data` argument - NOT
+    bolted on afterwards via fig.update_traces(customdata=...). When a
+    chart is split into multiple traces (color="position" does this,
+    every chart in the app uses it), each trace only contains a subset of
+    rows, and update_traces() broadcasts one array onto every trace
+    uniformly rather than subsetting it - so trace 2's points end up
+    showing customdata meant for completely different players. Letting
+    Plotly Express build custom_data at construction time keeps each
+    trace correctly matched to its own rows.
+
+    spec: list of (label, column, formatter) tuples. First entry is shown
+    bold with no label (the player's name); everything after gets a label,
+    e.g. ("Price", "price", lambda v: f"£{v:.1f}m").
     """
-    cols = [df[col].apply(fmt) for _, col, fmt in spec]
-    customdata = np.stack([c.to_numpy() for c in cols], axis=-1)
+    d = df.copy()
+    hover_cols = []
+    for i, (_, col, fmt) in enumerate(spec):
+        hcol = f"_hov_{i}"
+        d[hcol] = d[col].apply(fmt)
+        hover_cols.append(hcol)
     lines = ["<b>%{customdata[0]}</b>"]
     for i, (label, _, _) in enumerate(spec[1:], start=1):
         lines.append(f"{label}: %{{customdata[{i}]}}")
-    fig.update_traces(customdata=customdata, hovertemplate="<br>".join(lines) + "<extra></extra>")
-    return fig
+    template = "<br>".join(lines) + "<extra></extra>"
+    return d, hover_cols, template
 
 
 def core_hover_spec(extra=None):
@@ -164,10 +178,11 @@ def render_ranked_bar(df, score_col, x_label, sort_mode, n=12, score_fmt=None):
     else:
         d = d.sort_values(score_col)
     score_fmt = score_fmt or (lambda v: f"{v:.1f}")
+    d, hover_cols, template = hover_columns(d, core_hover_spec([(x_label, score_col, score_fmt)]))
     fig = px.bar(d, x=score_col, y="web_name", color="position", color_discrete_map=POSITION_COLORS,
-                 orientation="h", labels={score_col: x_label, "web_name": ""})
+                 orientation="h", labels={score_col: x_label, "web_name": ""}, custom_data=hover_cols)
     fig.update_yaxes(categoryorder="array", categoryarray=d["web_name"].tolist())
-    apply_hover(fig, d, core_hover_spec([(x_label, score_col, score_fmt)]))
+    fig.update_traces(hovertemplate=template)
     show(style_bar(fig, len(d)))
 
 
@@ -1109,22 +1124,24 @@ with tab_explorer:
         axis = st.radio("Axes", ["Price vs Ownership", "Price vs Points"], horizontal=True)
         st.caption(DEFINITIONS["price_vs_ownership" if axis == "Price vs Ownership" else "price_vs_points"])
         if axis == "Price vs Ownership":
+            d, hover_cols, template = hover_columns(filtered, core_hover_spec(
+                [(f"Value ({mode_label})", "value_basis", lambda v: f"{v:.0f} pts" if pd.notna(v) else "-")]))
             fig = px.scatter(
-                filtered, x="price", y="selected_by_percent", color="position",
-                color_discrete_map=POSITION_COLORS,
+                d, x="price", y="selected_by_percent", color="position",
+                color_discrete_map=POSITION_COLORS, custom_data=hover_cols,
                 labels={"price": "Price (£m)", "selected_by_percent": "Selected by (%)"},
             )
-            apply_hover(fig, filtered, core_hover_spec(
-                [(f"Value ({mode_label})", "value_basis", lambda v: f"{v:.0f} pts" if pd.notna(v) else "-")]))
+            fig.update_traces(hovertemplate=template)
             y_col = "selected_by_percent"
         else:
             pts_df = filtered.dropna(subset=["value_basis"])
+            d, hover_cols, template = hover_columns(pts_df, core_hover_spec())
             fig = px.scatter(
-                pts_df, x="price", y="value_basis", color="position",
-                color_discrete_map=POSITION_COLORS,
+                d, x="price", y="value_basis", color="position",
+                color_discrete_map=POSITION_COLORS, custom_data=hover_cols,
                 labels={"price": "Price (£m)", "value_basis": f"Value ({mode_label})"},
             )
-            apply_hover(fig, pts_df, core_hover_spec())
+            fig.update_traces(hovertemplate=template)
             y_col = "value_basis"
         if squad_names:
             owned = filtered[filtered["web_name"].isin(squad_names)]
@@ -1230,13 +1247,15 @@ with tab_compare:
         st.caption("Not enough data yet.")
     else:
         d = comp_sorted.sort_values("value_delta")
-        fig = px.bar(d, x="value_delta", y="web_name",
-                     color="position", color_discrete_map=POSITION_COLORS, orientation="h",
-                     labels={"value_delta": "Value change (pts/£m)", "web_name": ""})
-        apply_hover(fig, d, core_hover_spec([
+        d, hover_cols, template = hover_columns(d, core_hover_spec([
             ("Value then", "value_then", lambda v: f"{v:.1f} pts/£m" if pd.notna(v) else "-"),
             ("Value now", "value_now", lambda v: f"{v:.1f} pts/£m" if pd.notna(v) else "-"),
         ]))
+        fig = px.bar(d, x="value_delta", y="web_name",
+                     color="position", color_discrete_map=POSITION_COLORS, orientation="h",
+                     custom_data=hover_cols,
+                     labels={"value_delta": "Value change (pts/£m)", "web_name": ""})
+        fig.update_traces(hovertemplate=template)
         show(style_bar(fig, len(comp_sorted)))
 
     st.markdown("**Look up a player**")
@@ -1260,10 +1279,11 @@ with tab_watchlist:
         st.caption("No unmatched players currently in the pool.")
     else:
         d = new_players.sort_values("selected_by_percent")
+        d, hover_cols, template = hover_columns(d, core_hover_spec())
         fig = px.bar(d, x="selected_by_percent", y="web_name", orientation="h",
-                     color="position", color_discrete_map=POSITION_COLORS,
+                     color="position", color_discrete_map=POSITION_COLORS, custom_data=hover_cols,
                      labels={"selected_by_percent": "Owned (%)", "web_name": ""})
-        apply_hover(fig, d, core_hover_spec())
+        fig.update_traces(hovertemplate=template)
         show(style_bar(fig, len(new_players)))
 
     st.divider()
